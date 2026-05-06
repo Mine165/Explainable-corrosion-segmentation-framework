@@ -1,0 +1,208 @@
+from typing import Any, Optional, Union, Callable
+
+from segmentation_models_pytorch.base import (
+    ClassificationHead,
+    SegmentationHead,
+    SegmentationModel,
+)
+
+from segmentation_models_pytorch.base.hub_mixin import supports_config_loading
+
+from Decoder import SegformerDecoder
+import json
+import timm
+import copy
+import warnings
+import functools
+from torch.utils.model_zoo import load_url
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+from mix_transformer_layer_scale import mix_transformer_encoders
+from segmentation_models_pytorch.encoders._preprocessing import preprocess_input
+from segmentation_models_pytorch.encoders._legacy_pretrained_settings import pretrained_settings
+class Segformer_ls(SegmentationModel):
+    @supports_config_loading
+    def __init__(
+        self,
+        encoder_name: str = "resnet34",
+        encoder_depth: int = 5,
+        encoder_weights: Optional[str] = "imagenet",
+        decoder_segmentation_channels: int = 256,
+        in_channels: int = 3,
+        classes: int = 1,
+        activation: Optional[Union[str, Callable]] = None,
+        upsampling: int = 4,
+        aux_params: Optional[dict] = None,
+        **kwargs: dict[str, Any],
+    ):
+        super().__init__()
+
+        self.encoder = get_encoder(
+            encoder_name,
+            in_channels=in_channels,
+            depth=encoder_depth,
+            weights=encoder_weights,
+            **kwargs,
+        )
+
+        self.decoder = SegformerDecoder(
+            encoder_channels=self.encoder.out_channels,
+            encoder_depth=encoder_depth,
+            segmentation_channels=decoder_segmentation_channels,
+        )
+
+        self.segmentation_head = SegmentationHead(
+            in_channels=decoder_segmentation_channels,
+            out_channels=classes,
+            activation=activation,
+            kernel_size=1,
+            upsampling=upsampling,
+        )
+
+        if aux_params is not None:
+            self.classification_head = ClassificationHead(
+                in_channels=self.encoder.out_channels[-1], **aux_params
+            )
+        else:
+            self.classification_head = None
+
+        self.name = "segformer-{}".format(encoder_name)
+        self.initialize()
+__all__ = [
+    "encoders",
+    "get_encoder",
+    "get_encoder_names",
+    "get_preprocessing_params",
+    "get_preprocessing_fn",
+]
+
+encoders = {}
+encoders.update(mix_transformer_encoders)
+
+def is_equivalent_to_timm_universal(name):
+    patterns = [
+        "timm-regnet",
+        "timm-res2",
+        "timm-resnest",
+        "timm-mobilenetv3",
+        "timm-gernet",
+    ]
+    for pattern in patterns:
+        if name.startswith(pattern):
+            return True
+    return False
+
+def get_encoder(name, in_channels=3, depth=5, weights=None, output_stride=32, **kwargs):
+    if name.startswith("timm-"):
+        warnings.warn(
+            "`timm-` encoders are deprecated and will be removed in the future. "
+            "Please use `tu-` equivalent encoders instead (see 'Timm encoders' section in the documentation).",
+            DeprecationWarning,
+        )
+    if is_equivalent_to_timm_universal(name):
+        name = name.replace("timm-", "tu-")
+        if "mobilenetv3" in name:
+            name = name.replace("tu-", "tu-tf_")
+
+
+    if name not in encoders:
+        raise KeyError(
+            f"Wrong encoder name `{name}`, supported encoders: {list(encoders.keys())}"
+        )
+
+    params = copy.deepcopy(encoders[name]["params"])
+    params["depth"] = depth
+    params["output_stride"] = output_stride
+
+    EncoderClass = encoders[name]["encoder"]
+    encoder = EncoderClass(**params)
+
+    if weights is not None:
+        if weights not in encoders[name]["pretrained_settings"]:
+            available_weights = list(encoders[name]["pretrained_settings"].keys())
+            raise KeyError(
+                f"Wrong pretrained weights `{weights}` for encoder `{name}`. "
+                f"Available options are: {available_weights}"
+            )
+
+        settings = encoders[name]["pretrained_settings"][weights]
+        repo_id = settings["repo_id"]
+        revision = settings["revision"]
+        weights_path = None
+        try:
+            hf_hub_download(repo_id, filename="config.json", revision=revision)
+            weights_path = hf_hub_download(
+                repo_id, filename="model.safetensors", revision=revision
+            )
+        except Exception as e:
+            if name in pretrained_settings and weights in pretrained_settings[name]:
+                message = (
+                    f"Error loading {name} `{weights}` weights from Hugging Face Hub, "
+                    "trying loading from original url..."
+                )
+                warnings.warn(message, UserWarning)
+                url = pretrained_settings[name][weights]["url"]
+                state_dict = load_url(url, map_location="cpu")
+            else:
+                raise e
+
+        if weights_path is not None:
+            state_dict = load_file(weights_path, device="cpu")
+
+        encoder.load_state_dict(state_dict)
+
+    encoder.set_in_channels(in_channels, pretrained=weights is not None)
+    if output_stride != 32:
+        encoder.make_dilated(output_stride)
+
+    return encoder
+
+
+def get_encoder_names():
+    return list(encoders.keys())
+
+
+def get_preprocessing_params(encoder_name, pretrained="imagenet"):
+    if encoder_name.startswith("tu-"):
+        encoder_name = encoder_name[3:]
+        if not timm.models.is_model_pretrained(encoder_name):
+            raise ValueError(
+                f"{encoder_name} does not have pretrained weights and preprocessing parameters"
+            )
+        settings = timm.models.get_pretrained_cfg(encoder_name).__dict__
+    else:
+        all_settings = encoders[encoder_name]["pretrained_settings"]
+        if pretrained not in all_settings.keys():
+            raise ValueError(
+                "Available pretrained options {}".format(all_settings.keys())
+            )
+
+        repo_id = all_settings[pretrained]["repo_id"]
+        revision = all_settings[pretrained]["revision"]
+        try:
+            config_path = hf_hub_download(
+                repo_id, filename="config.json", revision=revision
+            )
+            with open(config_path, "r") as f:
+                settings = json.load(f)
+        except Exception as e:
+            if (
+                encoder_name in pretrained_settings
+                and pretrained in pretrained_settings[encoder_name]
+            ):
+                settings = pretrained_settings[encoder_name][pretrained]
+            else:
+                raise e
+
+    formatted_settings = {}
+    formatted_settings["input_space"] = settings.get("input_space", "RGB")
+    formatted_settings["input_range"] = list(settings.get("input_range", [0, 1]))
+    formatted_settings["mean"] = list(settings["mean"])
+    formatted_settings["std"] = list(settings["std"])
+
+    return formatted_settings
+
+
+def get_preprocessing_fn(encoder_name, pretrained="imagenet"):
+    params = get_preprocessing_params(encoder_name, pretrained=pretrained)
+    return functools.partial(preprocess_input, **params)
