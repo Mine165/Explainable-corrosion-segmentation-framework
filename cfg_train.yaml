@@ -1,0 +1,30 @@
+ECA: false
+RBC:
+- 0.3
+- 0.3
+- 0.6
+batch_size: 8
+cbam: false
+crop_size: 512
+data: D:/Users_files/corrosion_dataset/dataset/labels/corrosion.yaml
+encoder: mit_b2
+epochs: 200
+exp_name: ''
+flip: 40
+focal_loss: 1
+focal_loss_alpha_beta:
+- 0.6
+- 2
+imgsz: 512
+loss: FOCAL+tversky+BCE
+lr: 0.0002
+lr_f: 5.0e-06
+model: Segformer_ls
+pos_ratio: 0.6
+rotated: 40
+save_dir: D:\Users_files\corrosion_dataset\SMP\RUNS
+tversky_loss: 0.6
+tversky_loss_alpha_beta:
+- 0.4
+- 0.6
+workers: 4
